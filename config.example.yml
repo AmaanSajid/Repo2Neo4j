@@ -1,0 +1,35 @@
+repository:
+  path: /path/to/local/repo
+  name: my-project
+
+gitlab:
+  url: https://gitlab.company.com
+  project_id: 123
+  private_token: ${GITLAB_TOKEN}
+
+neo4j:
+  uri: bolt://localhost:7687
+  username: neo4j
+  password: ${NEO4J_PASSWORD}
+  database: neo4j
+
+parsing:
+  ast_enabled: true
+  languages:
+    - python
+    - typescript
+    - javascript
+    - java
+  ignore_patterns:
+    - "node_modules/**"
+    - "*.min.js"
+    - "vendor/**"
+    - "__pycache__/**"
+    - ".git/**"
+    - "*.pyc"
+    - "dist/**"
+    - "build/**"
+
+sync:
+  batch_size: 500
+  max_commits: null
