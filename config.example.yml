@@ -1,11 +1,13 @@
 repository:
   path: /path/to/local/repo
   name: my-project
+  branch: main                    # branch to ingest (default: repo's default branch)
 
 gitlab:
   url: https://gitlab.company.com
   project_id: 123
   private_token: ${GITLAB_TOKEN}
+  branch: main                    # only fetch MRs targeting this branch (omit for all MRs)
 
 neo4j:
   uri: bolt://localhost:7687

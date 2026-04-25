@@ -274,12 +274,17 @@ def ingest(
 
     try:
         branches = git_parser.get_branches()
-        default_tip = _default_branch_tip(git_parser)
-        resolved_default = next((b.name for b in branches if b.is_default), None)
-        if not resolved_default and branches:
-            resolved_default = branches[0].name
-        elif not resolved_default:
-            resolved_default = "main"
+        explicit_branch = cfg.repository.branch
+        if explicit_branch:
+            default_tip = explicit_branch
+            resolved_default = explicit_branch
+        else:
+            default_tip = _default_branch_tip(git_parser)
+            resolved_default = next((b.name for b in branches if b.is_default), None)
+            if not resolved_default and branches:
+                resolved_default = branches[0].name
+            elif not resolved_default:
+                resolved_default = "main"
 
         ingester.ingest_repository(
             name=cfg.repository.name,
@@ -314,7 +319,12 @@ def ingest(
                     cfg.gitlab.project_id,
                     cfg.gitlab.private_token,
                 )
-                mr_iter = gl.iter_merge_requests(state="all", updated_after=None, order_by="updated_at")
+                mr_iter = gl.iter_merge_requests(
+                    state="all",
+                    updated_after=None,
+                    order_by="updated_at",
+                    target_branch=cfg.gitlab.branch,
+                )
 
                 def mr_gen() -> Iterator[MergeRequestModel]:
                     yield from _tracked_iter(mr_iter, "Fetching merge requests", total=None)
@@ -379,7 +389,8 @@ def update(
                 "(subject to max_commits).[/yellow]"
             )
 
-        default_tip = _default_branch_tip(git_parser)
+        explicit_branch = cfg.repository.branch
+        default_tip = explicit_branch if explicit_branch else _default_branch_tip(git_parser)
         branches = git_parser.get_branches()
         ingester.ingest_branches(branches)
 
@@ -413,6 +424,7 @@ def update(
                     state="all",
                     updated_after=last_mr_dt,
                     order_by="updated_at",
+                    target_branch=cfg.gitlab.branch,
                 )
 
                 def mr_gen() -> Iterator[MergeRequestModel]:

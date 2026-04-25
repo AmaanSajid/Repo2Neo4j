@@ -106,8 +106,12 @@ class GitLabClient:
         state: str | None = None,
         updated_after: datetime | None = None,
         order_by: str = "updated_at",
+        target_branch: str | None = None,
     ) -> Iterator[MergeRequestModel]:
-        """Yield merge requests one at a time using server-side pagination (iterator)."""
+        """Yield merge requests one at a time using server-side pagination (iterator).
+
+        :param target_branch: If set, only return MRs targeting this branch (e.g. ``main``).
+        """
         if order_by not in _ALLOWED_MR_ORDER_BY:
             logger.warning(
                 "Unsupported order_by=%r; falling back to updated_at (allowed: %s)",
@@ -128,6 +132,8 @@ class GitLabClient:
             list_kwargs["state"] = "all"
         if updated_after is not None:
             list_kwargs["updated_after"] = _datetime_to_gitlab_param(updated_after)
+        if target_branch is not None:
+            list_kwargs["target_branch"] = target_branch
 
         logger.info(
             "Streaming merge requests for project id=%s (state=%s, updated_after=%s, order_by=%s)",

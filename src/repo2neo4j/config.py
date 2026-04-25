@@ -39,12 +39,14 @@ def _resolve_env_vars(value: Any) -> Any:
 class RepositoryConfig(BaseModel):
     path: str
     name: str
+    branch: str | None = None
 
 
 class GitLabConfig(BaseModel):
     url: str
     project_id: int
     private_token: str
+    branch: str | None = None
 
 
 class Neo4jConfig(BaseModel):
