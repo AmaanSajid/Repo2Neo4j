@@ -243,22 +243,54 @@ def schema_verify(
         raise typer.Exit(code=1)
 
 
+def _is_remote_mode(cfg: AppConfig) -> bool:
+    """True when no local repo path is configured and GitLab credentials are present."""
+    return not cfg.repository.path and cfg.gitlab is not None
+
+
+def _make_gitlab_client(cfg: AppConfig) -> GitLabClient:
+    assert cfg.gitlab is not None
+    return GitLabClient(cfg.gitlab.url, cfg.gitlab.project_id, cfg.gitlab.private_token)
+
+
+def _ingest_code_remote(
+    cfg: AppConfig,
+    ingester: GraphIngester,
+    gl: GitLabClient,
+    branch: str | None,
+) -> int:
+    """Fetch file tree + content from GitLab API and parse AST (no local clone)."""
+    if not cfg.parsing.ast_enabled:
+        logger.info("AST parsing disabled; skipping code structure ingestion.")
+        return 0
+    parser = CodeParser(cfg.parsing.languages, cfg.parsing.ignore_patterns)
+    file_paths = gl.get_file_tree_remote(branch=branch)
+    files = []
+    for fp in _tracked_iter(file_paths, "Parsing source files (remote)", total=len(file_paths)):
+        content = gl.get_file_content(fp, branch=branch)
+        if content is None:
+            continue
+        model = parser.parse_file_content(fp, content)
+        if model is not None:
+            files.append(model)
+    if files:
+        ingester.ingest_files(files)
+    return len(files)
+
+
 @app.command("ingest")
 def ingest(
     config: Path = typer.Option(..., "--config", help="Path to repo2neo4j YAML configuration."),
 ) -> None:
     """Run a full ingestion: repository, branches, commits, code (optional), and GitLab MRs."""
     cfg = _load_app_config(config)
-    repo_root = Path(cfg.repository.path).expanduser().resolve()
-    if not repo_root.is_dir():
-        _exit_error(f"Repository path is not a directory: {repo_root}")
+    repo_name = cfg.repo_name
+    remote = _is_remote_mode(cfg)
+
+    if not remote and not cfg.repository.path:
+        _exit_error("Either repository.path (local clone) or gitlab credentials (remote mode) must be configured.")
 
     stats = {"commits": 0, "files": 0, "merge_requests": 0}
-
-    try:
-        git_parser = GitParser(repo_root)
-    except git_exc.InvalidGitRepositoryError as exc:
-        _exit_error(str(exc), exc=exc)
 
     try:
         driver = _neo4j_driver(cfg)
@@ -268,78 +300,95 @@ def ingest(
     ingester = GraphIngester(
         driver,
         database=cfg.neo4j.database,
-        repo_name=cfg.repository.name,
+        repo_name=repo_name,
         batch_size=cfg.sync.batch_size,
     )
 
     try:
-        branches = git_parser.get_branches()
-        explicit_branch = cfg.repository.branch
-        if explicit_branch:
-            default_tip = explicit_branch
-            resolved_default = explicit_branch
-        else:
-            default_tip = _default_branch_tip(git_parser)
-            resolved_default = next((b.name for b in branches if b.is_default), None)
-            if not resolved_default and branches:
-                resolved_default = branches[0].name
-            elif not resolved_default:
-                resolved_default = "main"
+        if remote:
+            gl = _make_gitlab_client(cfg)
+            branch = cfg.gitlab.branch or cfg.repository.branch
+            branches = gl.get_branches(branch=branch)
+            resolved_default = branch or next((b.name for b in branches if b.is_default), "main")
 
-        ingester.ingest_repository(
-            name=cfg.repository.name,
-            url="",
-            default_branch=resolved_default,
-        )
-        ingester.ingest_branches(branches)
+            ingester.ingest_repository(name=repo_name, url=cfg.gitlab.url, default_branch=resolved_default)
+            ingester.ingest_branches(branches)
 
-        commit_iter = git_parser.iter_commits(
-            branch=default_tip,
-            since_hash=None,
-            max_count=cfg.sync.max_commits,
-        )
-        commits = list(
-            _tracked_iter(
-                commit_iter,
-                "Ingesting commits",
-                total=cfg.sync.max_commits,
+            commit_iter = gl.iter_commits_remote(
+                branch=resolved_default,
+                since_hash=None,
+                max_count=cfg.sync.max_commits,
             )
-        )
-        stats["commits"] = len(commits)
-        if commits:
-            ingester.ingest_commits(commits)
+            commits = list(_tracked_iter(commit_iter, "Ingesting commits (remote)", total=cfg.sync.max_commits))
+            stats["commits"] = len(commits)
+            if commits:
+                ingester.ingest_commits(commits)
 
-        stats["files"] = _ingest_code_structure(cfg, ingester, repo_root)
+            stats["files"] = _ingest_code_remote(cfg, ingester, gl, resolved_default)
 
-        max_mr_updated: datetime | None = None
-        if cfg.gitlab is not None:
+            mr_iter = gl.iter_merge_requests(state="all", updated_after=None, order_by="updated_at", target_branch=cfg.gitlab.branch)
+            mrs = list(_tracked_iter(mr_iter, "Fetching merge requests", total=None))
+            stats["merge_requests"] = len(mrs)
+            max_mr_updated: datetime | None = None
+            if mrs:
+                ingester.ingest_merge_requests(mrs)
+                max_mr_updated = _merge_request_max_updated(mrs)
+
+            head_hash = branches[0].head_commit_hash if branches and branches[0].head_commit_hash else ""
+            mr_ts = max_mr_updated.isoformat() if max_mr_updated else None
+            ingester.update_sync_state(last_commit_hash=head_hash, last_mr_updated_at=mr_ts)
+
+        else:
+            repo_root = Path(cfg.repository.path).expanduser().resolve()
+            if not repo_root.is_dir():
+                _exit_error(f"Repository path is not a directory: {repo_root}")
             try:
-                gl = GitLabClient(
-                    cfg.gitlab.url,
-                    cfg.gitlab.project_id,
-                    cfg.gitlab.private_token,
-                )
-                mr_iter = gl.iter_merge_requests(
-                    state="all",
-                    updated_after=None,
-                    order_by="updated_at",
-                    target_branch=cfg.gitlab.branch,
-                )
+                git_parser = GitParser(repo_root)
+            except git_exc.InvalidGitRepositoryError as exc:
+                _exit_error(str(exc), exc=exc)
 
-                def mr_gen() -> Iterator[MergeRequestModel]:
-                    yield from _tracked_iter(mr_iter, "Fetching merge requests", total=None)
+            branches = git_parser.get_branches()
+            explicit_branch = cfg.repository.branch
+            if explicit_branch:
+                default_tip = explicit_branch
+                resolved_default = explicit_branch
+            else:
+                default_tip = _default_branch_tip(git_parser)
+                resolved_default = next((b.name for b in branches if b.is_default), None)
+                if not resolved_default and branches:
+                    resolved_default = branches[0].name
+                elif not resolved_default:
+                    resolved_default = "main"
 
-                mrs = list(mr_gen())
-                stats["merge_requests"] = len(mrs)
-                if mrs:
-                    ingester.ingest_merge_requests(mrs)
-                    max_mr_updated = _merge_request_max_updated(mrs)
-            except GitlabError as exc:
-                _exit_error(f"GitLab merge request ingestion failed: {exc}", exc=exc)
+            ingester.ingest_repository(name=repo_name, url="", default_branch=resolved_default)
+            ingester.ingest_branches(branches)
 
-        head_hash = git_parser.repo.head.commit.hexsha
-        mr_ts = max_mr_updated.isoformat() if max_mr_updated else None
-        ingester.update_sync_state(last_commit_hash=head_hash, last_mr_updated_at=mr_ts)
+            commit_iter = git_parser.iter_commits(
+                branch=default_tip, since_hash=None, max_count=cfg.sync.max_commits,
+            )
+            commits = list(_tracked_iter(commit_iter, "Ingesting commits", total=cfg.sync.max_commits))
+            stats["commits"] = len(commits)
+            if commits:
+                ingester.ingest_commits(commits)
+
+            stats["files"] = _ingest_code_structure(cfg, ingester, repo_root)
+
+            max_mr_updated: datetime | None = None
+            if cfg.gitlab is not None:
+                try:
+                    gl = _make_gitlab_client(cfg)
+                    mr_iter = gl.iter_merge_requests(state="all", updated_after=None, order_by="updated_at", target_branch=cfg.gitlab.branch)
+                    mrs = list(_tracked_iter(mr_iter, "Fetching merge requests", total=None))
+                    stats["merge_requests"] = len(mrs)
+                    if mrs:
+                        ingester.ingest_merge_requests(mrs)
+                        max_mr_updated = _merge_request_max_updated(mrs)
+                except GitlabError as exc:
+                    _exit_error(f"GitLab merge request ingestion failed: {exc}", exc=exc)
+
+            head_hash = git_parser.repo.head.commit.hexsha
+            mr_ts = max_mr_updated.isoformat() if max_mr_updated else None
+            ingester.update_sync_state(last_commit_hash=head_hash, last_mr_updated_at=mr_ts)
 
     except Neo4jError as exc:
         _exit_error(f"Neo4j error during ingestion: {exc}", exc=exc)
@@ -355,16 +404,13 @@ def update(
 ) -> None:
     """Incremental update: new commits, updated MRs, and refreshed code structure at HEAD."""
     cfg = _load_app_config(config)
-    repo_root = Path(cfg.repository.path).expanduser().resolve()
-    if not repo_root.is_dir():
-        _exit_error(f"Repository path is not a directory: {repo_root}")
+    repo_name = cfg.repo_name
+    remote = _is_remote_mode(cfg)
+
+    if not remote and not cfg.repository.path:
+        _exit_error("Either repository.path (local clone) or gitlab credentials (remote mode) must be configured.")
 
     stats = {"commits": 0, "files": 0, "merge_requests": 0}
-
-    try:
-        git_parser = GitParser(repo_root)
-    except git_exc.InvalidGitRepositoryError as exc:
-        _exit_error(str(exc), exc=exc)
 
     try:
         driver = _neo4j_driver(cfg)
@@ -374,7 +420,7 @@ def update(
     ingester = GraphIngester(
         driver,
         database=cfg.neo4j.database,
-        repo_name=cfg.repository.name,
+        repo_name=repo_name,
         batch_size=cfg.sync.batch_size,
     )
 
@@ -389,58 +435,79 @@ def update(
                 "(subject to max_commits).[/yellow]"
             )
 
-        explicit_branch = cfg.repository.branch
-        default_tip = explicit_branch if explicit_branch else _default_branch_tip(git_parser)
-        branches = git_parser.get_branches()
-        ingester.ingest_branches(branches)
+        if remote:
+            gl = _make_gitlab_client(cfg)
+            branch = cfg.gitlab.branch or cfg.repository.branch
+            branches = gl.get_branches(branch=branch)
+            resolved_default = branch or next((b.name for b in branches if b.is_default), "main")
+            ingester.ingest_branches(branches)
 
-        commit_iter = git_parser.iter_commits(
-            branch=default_tip,
-            since_hash=str(since_hash) if since_hash else None,
-            max_count=cfg.sync.max_commits,
-        )
-        commits = list(
-            _tracked_iter(
-                commit_iter,
-                "Processing new commits",
-                total=cfg.sync.max_commits,
+            commit_iter = gl.iter_commits_remote(
+                branch=resolved_default,
+                since_hash=str(since_hash) if since_hash else None,
+                max_count=cfg.sync.max_commits,
             )
-        )
-        stats["commits"] = len(commits)
-        if commits:
-            ingester.ingest_commits(commits)
+            commits = list(_tracked_iter(commit_iter, "Processing new commits (remote)", total=cfg.sync.max_commits))
+            stats["commits"] = len(commits)
+            if commits:
+                ingester.ingest_commits(commits)
 
-        stats["files"] = _ingest_code_structure(cfg, ingester, repo_root)
+            stats["files"] = _ingest_code_remote(cfg, ingester, gl, resolved_default)
 
-        max_mr_updated: datetime | None = None
-        if cfg.gitlab is not None:
+            max_mr_updated: datetime | None = None
+            mr_iter = gl.iter_merge_requests(state="all", updated_after=last_mr_dt, order_by="updated_at", target_branch=cfg.gitlab.branch)
+            mrs = list(_tracked_iter(mr_iter, "Fetching updated merge requests", total=None))
+            stats["merge_requests"] = len(mrs)
+            if mrs:
+                ingester.ingest_merge_requests(mrs)
+                max_mr_updated = _merge_request_max_updated(mrs)
+
+            head_hash = branches[0].head_commit_hash if branches and branches[0].head_commit_hash else ""
+            mr_ts = max_mr_updated.isoformat() if max_mr_updated is not None else None
+            ingester.update_sync_state(last_commit_hash=head_hash, last_mr_updated_at=mr_ts)
+
+        else:
+            repo_root = Path(cfg.repository.path).expanduser().resolve()
+            if not repo_root.is_dir():
+                _exit_error(f"Repository path is not a directory: {repo_root}")
             try:
-                gl = GitLabClient(
-                    cfg.gitlab.url,
-                    cfg.gitlab.project_id,
-                    cfg.gitlab.private_token,
-                )
-                mr_iter = gl.iter_merge_requests(
-                    state="all",
-                    updated_after=last_mr_dt,
-                    order_by="updated_at",
-                    target_branch=cfg.gitlab.branch,
-                )
+                git_parser = GitParser(repo_root)
+            except git_exc.InvalidGitRepositoryError as exc:
+                _exit_error(str(exc), exc=exc)
 
-                def mr_gen() -> Iterator[MergeRequestModel]:
-                    yield from _tracked_iter(mr_iter, "Fetching updated merge requests", total=None)
+            explicit_branch = cfg.repository.branch
+            default_tip = explicit_branch if explicit_branch else _default_branch_tip(git_parser)
+            branches = git_parser.get_branches()
+            ingester.ingest_branches(branches)
 
-                mrs = list(mr_gen())
-                stats["merge_requests"] = len(mrs)
-                if mrs:
-                    ingester.ingest_merge_requests(mrs)
-                    max_mr_updated = _merge_request_max_updated(mrs)
-            except GitlabError as exc:
-                _exit_error(f"GitLab merge request update failed: {exc}", exc=exc)
+            commit_iter = git_parser.iter_commits(
+                branch=default_tip,
+                since_hash=str(since_hash) if since_hash else None,
+                max_count=cfg.sync.max_commits,
+            )
+            commits = list(_tracked_iter(commit_iter, "Processing new commits", total=cfg.sync.max_commits))
+            stats["commits"] = len(commits)
+            if commits:
+                ingester.ingest_commits(commits)
 
-        head_hash = git_parser.repo.head.commit.hexsha
-        mr_ts = max_mr_updated.isoformat() if max_mr_updated is not None else None
-        ingester.update_sync_state(last_commit_hash=head_hash, last_mr_updated_at=mr_ts)
+            stats["files"] = _ingest_code_structure(cfg, ingester, repo_root)
+
+            max_mr_updated: datetime | None = None
+            if cfg.gitlab is not None:
+                try:
+                    gl = _make_gitlab_client(cfg)
+                    mr_iter = gl.iter_merge_requests(state="all", updated_after=last_mr_dt, order_by="updated_at", target_branch=cfg.gitlab.branch)
+                    mrs = list(_tracked_iter(mr_iter, "Fetching updated merge requests", total=None))
+                    stats["merge_requests"] = len(mrs)
+                    if mrs:
+                        ingester.ingest_merge_requests(mrs)
+                        max_mr_updated = _merge_request_max_updated(mrs)
+                except GitlabError as exc:
+                    _exit_error(f"GitLab merge request update failed: {exc}", exc=exc)
+
+            head_hash = git_parser.repo.head.commit.hexsha
+            mr_ts = max_mr_updated.isoformat() if max_mr_updated is not None else None
+            ingester.update_sync_state(last_commit_hash=head_hash, last_mr_updated_at=mr_ts)
 
     except Neo4jError as exc:
         _exit_error(f"Neo4j error during update: {exc}", exc=exc)

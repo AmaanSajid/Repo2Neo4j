@@ -63,7 +63,7 @@ class AgentQueryAPI:
             neo4j_user=neo.username,
             neo4j_password=neo.password,
             database=neo.database,
-            repo_name=config.repository.name,
+            repo_name=config.repo_name,
         )
 
     def close(self) -> None:

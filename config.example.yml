@@ -1,13 +1,38 @@
+# ── Option A: Local clone + optional GitLab MRs ──
+# repository:
+#   path: /path/to/local/repo
+#   name: my-project
+#   branch: main
+#
+# gitlab:                              # optional — adds MR data on top of local Git history
+#   url: https://gitlab.company.com
+#   project_id: 123
+#   private_token: ${GITLAB_TOKEN}
+#   branch: main
+
+# ── Option B: GitLab-only (no local clone needed) ──
+# Just provide gitlab credentials, omit repository.path
+#
+# repository:
+#   name: my-project                   # optional — defaults to "project-<project_id>"
+#
+# gitlab:
+#   url: https://gitlab.company.com
+#   project_id: 123
+#   private_token: ${GITLAB_TOKEN}
+#   branch: main                       # which branch to ingest
+
+# ── Active config (edit this) ──
+
 repository:
-  path: /path/to/local/repo
   name: my-project
-  branch: main                    # branch to ingest (default: repo's default branch)
+  # path: /path/to/local/repo         # uncomment for local clone mode
 
 gitlab:
   url: https://gitlab.company.com
   project_id: 123
   private_token: ${GITLAB_TOKEN}
-  branch: main                    # only fetch MRs targeting this branch (omit for all MRs)
+  branch: main
 
 neo4j:
   uri: bolt://localhost:7687

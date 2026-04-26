@@ -37,8 +37,8 @@ def _resolve_env_vars(value: Any) -> Any:
 
 
 class RepositoryConfig(BaseModel):
-    path: str
-    name: str
+    path: str | None = None
+    name: str | None = None
     branch: str | None = None
 
 
@@ -78,11 +78,20 @@ class SyncConfig(BaseModel):
 
 
 class AppConfig(BaseModel):
-    repository: RepositoryConfig
+    repository: RepositoryConfig = Field(default_factory=RepositoryConfig)
     gitlab: GitLabConfig | None = None
     neo4j: Neo4jConfig = Field(default_factory=Neo4jConfig)
     parsing: ParsingConfig = Field(default_factory=ParsingConfig)
     sync: SyncConfig = Field(default_factory=SyncConfig)
+
+    @property
+    def repo_name(self) -> str:
+        """Resolve the repository name: explicit config > GitLab project_id > fallback."""
+        if self.repository.name:
+            return self.repository.name
+        if self.gitlab:
+            return f"project-{self.gitlab.project_id}"
+        raise ValueError("Either repository.name or gitlab.project_id must be set")
 
 
 def load_config(config_path: str | Path) -> AppConfig:

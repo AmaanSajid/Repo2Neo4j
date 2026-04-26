@@ -18,6 +18,13 @@ from gitlab.exceptions import (
 )
 from gitlab.v4.objects import ProjectMergeRequest
 
+from repo2neo4j.models.git import (
+    AuthorModel,
+    BranchModel,
+    CommitModel,
+    DiffStatus,
+    FileDiffModel,
+)
 from repo2neo4j.models.gitlab import (
     MergeRequestModel,
     MRDiffModel,
@@ -361,6 +368,132 @@ class GitLabClient:
             diffs=diffs,
             labels=labels,
         )
+
+    # ── Remote repository methods (no local clone needed) ──
+
+    def get_branches(self, branch: str | None = None) -> list[BranchModel]:
+        """Fetch branches from GitLab API. If *branch* is set, return only that one."""
+        if branch:
+            raw = self._with_retry(
+                f"branches.get({branch})",
+                lambda: self._project.branches.get(branch),
+            )
+            return [BranchModel(
+                name=raw.name,
+                is_default=(raw.name == getattr(self._project, "default_branch", "main")),
+                head_commit_hash=raw.commit["id"] if raw.commit else None,
+            )]
+
+        raw_list = self._with_retry(
+            "branches.list",
+            lambda: self._project.branches.list(iterator=True, per_page=_DEFAULT_PER_PAGE),
+        )
+        default_branch = getattr(self._project, "default_branch", "main")
+        models: list[BranchModel] = []
+        for b in raw_list:
+            models.append(BranchModel(
+                name=b.name,
+                is_default=(b.name == default_branch),
+                head_commit_hash=b.commit["id"] if b.commit else None,
+            ))
+        return sorted(models, key=lambda m: m.name)
+
+    def iter_commits_remote(
+        self,
+        branch: str | None = None,
+        since_hash: str | None = None,
+        max_count: int | None = None,
+    ) -> Iterator[CommitModel]:
+        """Yield commits from the GitLab API (newest-first), no local clone needed."""
+        ref = branch or getattr(self._project, "default_branch", "main")
+        list_kwargs: dict[str, Any] = {
+            "ref_name": ref,
+            "iterator": True,
+            "per_page": _DEFAULT_PER_PAGE,
+        }
+
+        commit_list = self._with_retry(
+            "commits.list",
+            lambda: self._project.commits.list(**list_kwargs),
+        )
+
+        count = 0
+        for raw_commit in commit_list:
+            sha = raw_commit.id
+            if since_hash and sha == since_hash:
+                break
+
+            diff_list = self._with_retry(
+                f"commit.diff({sha[:8]})",
+                lambda sha=sha: self._project.commits.get(sha).diff(),
+            )
+            diffs: list[FileDiffModel] = []
+            for d in diff_list:
+                status = DiffStatus.ADDED if d.get("new_file") else (
+                    DiffStatus.DELETED if d.get("deleted_file") else (
+                        DiffStatus.RENAMED if d.get("renamed_file") else DiffStatus.MODIFIED
+                    )
+                )
+                path = d.get("new_path") or d.get("old_path") or ""
+                old_path = d.get("old_path") if status == DiffStatus.RENAMED else None
+                diff_text = d.get("diff", "")
+                additions = sum(1 for line in diff_text.splitlines() if line.startswith("+") and not line.startswith("+++"))
+                deletions = sum(1 for line in diff_text.splitlines() if line.startswith("-") and not line.startswith("---"))
+                diffs.append(FileDiffModel(
+                    path=path,
+                    old_path=old_path,
+                    status=status,
+                    additions=additions,
+                    deletions=deletions,
+                ))
+
+            author_name = raw_commit.author_name or ""
+            author_email = raw_commit.author_email or ""
+            committer_name = raw_commit.committer_name or author_name
+            committer_email = raw_commit.committer_email or author_email
+            ts = datetime.fromisoformat(raw_commit.committed_date.replace("Z", "+00:00"))
+
+            yield CommitModel(
+                hash=sha,
+                short_hash=sha[:8],
+                message=raw_commit.message or "",
+                author=AuthorModel(name=author_name, email=author_email),
+                committer=AuthorModel(name=committer_name, email=committer_email),
+                timestamp=ts,
+                parent_hashes=raw_commit.parent_ids or [],
+                diffs=diffs,
+                branch=ref,
+            )
+            count += 1
+            if max_count and count >= max_count:
+                break
+
+    def get_file_tree_remote(self, branch: str | None = None) -> list[str]:
+        """Return sorted file paths at the tip of *branch* via GitLab API."""
+        ref = branch or getattr(self._project, "default_branch", "main")
+        tree = self._with_retry(
+            "repository_tree",
+            lambda: self._project.repository_tree(
+                ref=ref, recursive=True, iterator=True, per_page=_DEFAULT_PER_PAGE,
+            ),
+        )
+        return sorted(
+            item["path"] for item in tree if item.get("type") == "blob"
+        )
+
+    def get_file_content(self, file_path: str, branch: str | None = None) -> str | None:
+        """Fetch raw file content via GitLab API. Returns None on 404."""
+        ref = branch or getattr(self._project, "default_branch", "main")
+        try:
+            f = self._with_retry(
+                f"files.get({file_path})",
+                lambda: self._project.files.get(file_path=file_path, ref=ref),
+            )
+            return f.decode().decode("utf-8", errors="replace")
+        except GitlabGetError as exc:
+            if getattr(exc, "response_code", None) == 404:
+                return None
+            raise
 
     def _with_retry(self, operation: str, fn: Callable[[], T]) -> T:
         """Extra retries beyond python-gitlab's built-in 429 / transient handling."""

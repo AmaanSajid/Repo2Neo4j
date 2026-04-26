@@ -628,6 +628,43 @@ class CodeParser:
             imports=imports,
         )
 
+    def parse_file_content(self, rel_path: str, content: str) -> FileModel | None:
+        """Parse a file from its content string (no disk access). For remote/API mode."""
+        if _matches_ignore(rel_path, self._ignore_patterns):
+            return None
+        lang_name = self._detect_language(Path(rel_path))
+        if lang_name is None:
+            return None
+        cfg = LANGUAGE_REGISTRY.get(lang_name)
+        if cfg is None:
+            return None
+        parser = self._parser_for(lang_name)
+        if parser is None:
+            return None
+        source = content.encode("utf-8")
+        try:
+            tree = parser.parse(source)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("tree-sitter failed to parse %s: %s", rel_path, exc)
+            return None
+        if tree.root_node.has_error:
+            logger.debug("Parse tree for %s contains errors; extracting best-effort.", rel_path)
+        try:
+            classes = self._extract_classes(tree, source, rel_path, cfg)
+            functions = self._extract_functions(tree, source, rel_path, cfg)
+            imports = self._extract_imports(tree, source, rel_path, cfg)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Extraction failed for %s: %s", rel_path, exc)
+            return None
+        return FileModel(
+            path=rel_path,
+            language=cfg.name,
+            size=len(source),
+            classes=classes,
+            functions=functions,
+            imports=imports,
+        )
+
     def iter_parse_directory(
         self,
         directory: str | Path,
